@@ -4,18 +4,20 @@ ViT-B/16 + OCT Biomarkers Fusion Pipeline — Small-Dataset Fixes
 =============================================================================
 
 Run with:
-    python vitb16_oct_kfold_tm.py t    ← temporal transformer aggregation
-    python vitb16_oct_kfold_tm.py m    ← mean pooling (9 slices, default)
-    python vitb16_oct_kfold_tm.py v    ← OCT volume slices (32 slices, mean pooling)
+    python vitb16_oct_kfold_tm.py t    ← temporal transformer (9 slices, en face)
+    python vitb16_oct_kfold_tm.py m    ← mean pooling (9 slices, en face, default)
+    python vitb16_oct_kfold_tm.py v    ← mean pooling (32 slices, en face volume)
+    python vitb16_oct_kfold_tm.py s    ← mean pooling (32 slices, second OCT modality)
 
 Modes:
-    t  : ImageSetTransformer aggregates the N per-slice ViT-B/16 embeddings
-         (CLS token + 2 transformer encoder layers, 4 heads, ff_dim=1536).
-    m  : Mean-pool across 9 slices.
-    v  : Mean-pool across all 32 OCT volume slices (slice_1 … slice_32).
-         Designed for datasets where the full OCT volume is available.
-         Aggregation is mean pooling — same logic as 'm' but with 32 slices
-         instead of 9, giving the model richer volumetric coverage.
+    t  : ImageSetTransformer aggregates N per-slice ViT-B/16 embeddings
+         (CLS token + 1 transformer encoder layer, 4 heads, ff_dim=1536).
+         Uses en face OCT, 9 slices.
+    m  : Mean-pool across 9 en face OCT slices.
+    v  : Mean-pool across all 32 en face OCT volume slices (slice_1 … slice_32).
+    s  : Mean-pool across 32 slices from a SECOND OCT modality
+         (different image root folder, same slice naming convention).
+         Update IMAGE_ROOT_MODALITY2 below to point to your data.
 =============================================================================
 """
 
@@ -56,8 +58,14 @@ IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 VIT_B16_DIM = 768
 PCA_COMPS   = 15
 
-# 32 OCT volume slices used in mode 'v'
-VOLUME_SLICE_NAMES = [f"slice_{i}" for i in range(32, 0, -1)]  # slice_32 … slice_1
+# Slice lists
+ENFACE_9_SLICES   = [f"slice_{i}" for i in range(9, 0, -1)]   # slice_9 … slice_1
+VOLUME_32_SLICES  = [f"slice_{i}" for i in range(32, 0, -1)]  # slice_32 … slice_1
+MODALITY2_SLICES  = [f"slice_{i}" for i in range(32, 0, -1)]  # 32 slices, second modality
+
+# ---- Path for second OCT modality images (mode 's') ----
+# Update this to the folder that contains the second modality patient folders.
+IMAGE_ROOT_MODALITY2 = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_modality2_images_b1_b2"
 
 
 # =============================================================================
@@ -66,24 +74,26 @@ VOLUME_SLICE_NAMES = [f"slice_{i}" for i in range(32, 0, -1)]  # slice_32 … sl
 
 def parse_mode() -> str:
     """
-    Returns 't', 'm', or 'v'.
-      t — temporal transformer (9 slices)
-      m — mean pooling         (9 slices, default)
-      v — mean pooling         (32 OCT volume slices)
+    Returns 't', 'm', 'v', or 's'.
+      t — temporal transformer, en face, 9 slices
+      m — mean pooling,         en face, 9 slices  (default)
+      v — mean pooling,         en face, 32 slices (full volume)
+      s — mean pooling,         second OCT modality, 32 slices
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("mode", nargs="?", default="m",
-                        choices=["t", "m", "v"],
-                        help="t=temporal transformer, m=mean pooling, "
-                             "v=OCT volume slices (32 slices, mean pooling)")
+                        choices=["t", "m", "v", "s"],
+                        help="t=temporal transformer, m=mean pooling (9 slices), "
+                             "v=volume 32 slices, s=second OCT modality 32 slices")
     args, _ = parser.parse_known_args()
     mode = args.mode.lower()
     desc = {
-        "t": "Temporal Transformer (2 layers, 4 heads) — 9 slices",
-        "m": "Mean Average Pooling — 9 slices",
-        "v": "Mean Average Pooling — 32 OCT volume slices",
+        "t": "Temporal Transformer (1 layer, 4 heads) — en face, 9 slices",
+        "m": "Mean Average Pooling — en face, 9 slices",
+        "v": "Mean Average Pooling — en face volume, 32 slices",
+        "s": "Mean Average Pooling — second OCT modality, 32 slices",
     }[mode]
-    print(f"[Mode] Image aggregation: {desc}")
+    print(f"[Mode] {desc}")
     return mode
 
 
@@ -257,7 +267,7 @@ class BiomarkerEncoder(nn.Module):
 #    use_temporal=True  : ViTB16Encoder × N slices → ImageSetTransformer → (B, 768)
 #    use_temporal=False : ViTB16Encoder × N slices → mean-pool → (B, 768)
 #
-#    Works for any N slices (9 for modes 'm'/'t', 32 for mode 'v').
+#    Works for any N slices and any image modality.
 # =============================================================================
 
 class FusionModel(nn.Module):
@@ -432,7 +442,7 @@ def train_fold_model(model, X_tr, y_tr, X_vl, y_vl, epochs, lr,
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
-    best_val_auc = 0
+    best_val_auc  = 0
     best_val_loss = float("inf")
     no_improve    = 0
 
@@ -472,7 +482,7 @@ def train_fold_model(model, X_tr, y_tr, X_vl, y_vl, epochs, lr,
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
-            no_improve    = 0
+            no_improve   = 0
             torch.save(model.state_dict(), best_path)
             print(f"    ✓ New best val auc={best_val_auc:.4f}  "
                   f"(epoch {epoch}, val_auc={val_auc:.4f})")
@@ -740,7 +750,7 @@ def run_kfold(all_subject_ids, df_biomarkers, y, label_names,
     print(f"  {'Mean':>6}  {np.mean(accs):>9.4f}  {np.mean(aucs):>9.4f}  "
           f"{np.mean(senss):>7.4f}  {np.mean(specs):>7.4f}")
     print(f"  {'Std':>6}  {np.std(accs):>9.4f}  {np.std(aucs):>9.4f}  "
-          f"{np.mean(senss):>7.4f}  {np.std(specs):>7.4f}")
+          f"{np.std(senss):>7.4f}  {np.std(specs):>7.4f}")
 
     print(f"\n  Aggregate Classification Report (all folds pooled):")
     print(classification_report(all_test_labels, all_test_preds,
@@ -768,36 +778,37 @@ def run_kfold(all_subject_ids, df_biomarkers, y, label_names,
 def main(mode: str):
     use_temporal = (mode == "t")
 
-    # mode 'v': 32 OCT volume slices with mean pooling
-    # modes 'm'/'t': 9 slices
-    if mode == "v":
-        slice_names = VOLUME_SLICE_NAMES   # slice_32 … slice_1 (32 total)
+    if mode == "s":
+        # Second OCT modality — different image folder, 32 slices, mean pooling
+        slice_names = MODALITY2_SLICES
+        image_root  = IMAGE_ROOT_MODALITY2
+        mode_label  = "oct_modality2_slices_32"
+    elif mode == "v":
+        # En face OCT full volume — same folder as 'm'/'t', 32 slices
+        slice_names = VOLUME_32_SLICES
+        image_root  = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
         mode_label  = "oct_volume_slices_32"
     elif mode == "t":
-        slice_names = [
-            "slice_9", "slice_8", "slice_7", "slice_6", "slice_5",
-            "slice_4", "slice_3", "slice_2", "slice_1",
-        ]
+        slice_names = ENFACE_9_SLICES
+        image_root  = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
         mode_label  = "temporal_transformer"
-    else:
-        slice_names = [
-            "slice_9", "slice_8", "slice_7", "slice_6", "slice_5",
-            "slice_4", "slice_3", "slice_2", "slice_1",
-        ]
+    else:  # 'm'
+        slice_names = ENFACE_9_SLICES
+        image_root  = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
         mode_label  = "mean_pooling"
 
     print("=" * 70)
     print(f"  ViT-B/16 + OCT Fusion — 5-Fold CV  [{mode_label}]")
-    print(f"  Slices: {len(slice_names)}")
+    print(f"  Slices   : {len(slice_names)}")
+    print(f"  ImageRoot: {image_root}")
     print("=" * 70)
 
     CSV_PATH            = "/home/suhel.khan/Dimentia_Project/LKC_Dimentia_structured_data/merged_output_b1_b2_CNvsCI_Refined.csv"
     TARGET_COL          = "Dia"
     SUBJECT_ID_COL      = "Subj_ID"
-    IMAGE_ROOT          = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
     WEIGHTS_DIR         = (
         f"/home/suhel.khan/Dimentia_Project/Weights/"
-        f"5fold_2_thresh_fixed_slice1-9_afterb2_CN_CI_Again_{mode_label}"
+        f"5fold_2_thresh_CN_CI_{mode_label}"
     )
 
     FEATURE_SCORE_CSV   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real.csv"
@@ -819,9 +830,9 @@ def main(mode: str):
     )
 
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
-    print(f"\n  Device: {device}")
-    print(f"  Image aggregation: "
-          f"{'Temporal Transformer (2 layers, 4 heads)' if use_temporal else 'Mean Average Pooling'}")
+    print(f"\n  Device     : {device}")
+    print(f"  Aggregation: "
+          f"{'Temporal Transformer (1L, 4H)' if use_temporal else 'Mean Average Pooling'}")
     print(f"  Slice count: {len(slice_names)}")
 
     df           = pd.read_csv(CSV_PATH)
@@ -847,7 +858,7 @@ def main(mode: str):
         FEATURE_SCORE_COL, SCORE_THRESHOLD, all_bio_cols)
     print(f"  Features selected: {len(selected_features)}")
 
-    folder_map = build_subject_folder_map(IMAGE_ROOT)
+    folder_map = build_subject_folder_map(image_root)
 
     run_kfold(subject_ids, df_bio, y, label_names,
               selected_features, folder_map, slice_names, cfg,
@@ -864,6 +875,7 @@ if __name__ == "__main__":
         "t": "temporal_transformer",
         "m": "mean_pooling",
         "v": "oct_volume_slices_32",
+        "s": "oct_modality2_slices_32",
     }[mode]
     LOG_PATH = (
         f"/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/"
