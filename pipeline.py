@@ -34,7 +34,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.models import vit_b_16, ViT_B_16_Weights
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 warnings.filterwarnings("ignore")
 SEED        = 42
@@ -61,7 +61,7 @@ FEATURE_SCORE_COL   = "score"
 SCORE_THRESHOLD     = 2.0
 
 IMAGE_ROOT_ENFACE   = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
-IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/OCTA_images_b1_b2"  # <-- update
+IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"  # <-- update if needed
 
 WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion"
 LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion.txt"
@@ -160,16 +160,19 @@ def load_slices(subject_id, folder_map, slice_names, transform):
     frames = []
     for sn in slice_names:
         path = stem_map.get(Path(sn).stem.lower())
+        tensor = torch.zeros(3, 224, 224)
         if path:
-            img = Image.open(path).convert("RGB")
-            arr = np.array(img).astype(np.float32) / 255.0
-            for c in range(3):
-                ch = arr[..., c]
-                arr[..., c] = (ch - ch.mean()) / (ch.std() + 1e-8)
-            img = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8))
-            frames.append(transform(img))
-        else:
-            frames.append(torch.zeros(3, 224, 224))
+            try:
+                img = Image.open(path).convert("RGB")
+                arr = np.array(img).astype(np.float32) / 255.0
+                for c in range(3):
+                    ch = arr[..., c]
+                    arr[..., c] = (ch - ch.mean()) / (ch.std() + 1e-8)
+                img = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8))
+                tensor = transform(img)
+            except (UnidentifiedImageError, OSError, Exception) as e:
+                print(f"[WARN] skipping corrupt slice {path}: {e}")
+        frames.append(tensor)
     return torch.stack(frames)   # (N, 3, 224, 224)
 
 
@@ -332,7 +335,7 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path):
         if vl_auc > best_auc:
             best_auc = vl_auc;  no_imp = 0
             torch.save(model.state_dict(), best_path)
-            print(f"    ✓ best val_auc={best_auc:.4f} (epoch {epoch})")
+            print(f"    checkmark best val_auc={best_auc:.4f} (epoch {epoch})")
         else:
             no_imp += 1
             torch.save(model.state_dict(), last_path)
@@ -359,7 +362,7 @@ def evaluate(model, loader, label_names, subject_ids=None):
 
     # per-patient table
     lnames = label_names
-    sep    = "─" * 90
+    sep    = "-" * 90
     print(f"\n{sep}")
     print(f"  {'#':>4}  {'Subject ID':>22}  {'Actual':>10}  {'Predicted':>10}  "
           f"{'P(H)':>8}  {'P(D)':>8}  {'OK':>4}")
@@ -367,7 +370,7 @@ def evaluate(model, loader, label_names, subject_ids=None):
     ids = subject_ids or [f"P{i}" for i in range(len(all_labels))]
     for i, (sid, gt, pred, prb) in enumerate(
             zip(ids, all_labels, all_preds, all_probs)):
-        ok = "✓" if int(gt) == int(pred) else "✗"
+        ok = "OK" if int(gt) == int(pred) else "X"
         print(f"  {i+1:>4}  {str(sid):>22}  "
               f"{lnames.get(int(gt),'?'):>10}  "
               f"{lnames.get(int(pred),'?'):>10}  "
