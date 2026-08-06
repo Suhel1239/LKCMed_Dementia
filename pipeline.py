@@ -88,7 +88,7 @@ CFG = dict(
 class Tee:
     def __init__(self, path):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._f = open(path, "a", encoding="utf-8")  # append so resume doesn't wipe log
+        self._f = open(path, "a", encoding="utf-8")
         self._s = sys.__stdout__
     def write(self, m):  self._s.write(m);  self._f.write(m)
     def flush(self):     self._s.flush();   self._f.flush()
@@ -252,17 +252,20 @@ class TriModalFusionModel(nn.Module):
 
 
 # =============================================================================
+# CHECKPOINT HELPERS
+# =============================================================================
+
+def _is_new_format(ckpt: dict) -> bool:
+    """True if checkpoint was saved by this pipeline (has metadata keys)."""
+    return isinstance(ckpt, dict) and "epoch" in ckpt and "model" in ckpt
+
+
+# =============================================================================
 # TRAINING  (with resume support)
 # =============================================================================
 
 def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
                resume_ckpt_path=None):
-    """
-    Trains one fold.  If resume_ckpt_path points to an existing file the
-    model, optimizer, scheduler, best_auc, no_imp, and start_epoch are all
-    restored from that checkpoint so training continues exactly where it
-    stopped.
-    """
     counts    = np.bincount(y_tr)
     weights   = torch.tensor(1.0 / (counts + 1e-6), dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
@@ -275,19 +278,23 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
     best_auc    = 0.0
     no_imp      = 0
 
-    # ---- resume ----
     if resume_ckpt_path and os.path.isfile(resume_ckpt_path):
         ckpt = torch.load(resume_ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        best_auc    = ckpt["best_auc"]
-        no_imp      = ckpt["no_imp"]
-        start_epoch = ckpt["epoch"] + 1
-        print(f"  [RESUME] fold checkpoint loaded from {resume_ckpt_path}")
-        print(f"           resuming at epoch {start_epoch}  "
-              f"best_auc={best_auc:.4f}  no_imp={no_imp}")
-    # ----------------
+        if _is_new_format(ckpt):
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            best_auc    = ckpt["best_auc"]
+            no_imp      = ckpt["no_imp"]
+            start_epoch = ckpt["epoch"] + 1
+            print(f"  [RESUME] continuing from epoch {start_epoch}  "
+                  f"best_auc={best_auc:.4f}  no_imp={no_imp}")
+        else:
+            # old plain state_dict — load weights only, restart epoch count
+            model.load_state_dict(ckpt)
+            print(f"  [RESUME] loaded plain state_dict from {resume_ckpt_path} "
+                  f"(old format) — epoch/optimizer state not available, "
+                  f"resuming from epoch 1 with loaded weights")
 
     tr_loader = DataLoader(train_ds, batch_size=len(train_ds),
                            shuffle=True,  num_workers=0)
@@ -325,15 +332,13 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
             print(f"  Epoch {epoch:03d} | loss={loss.item():.4f} | "
                   f"val_acc={vl_acc:.4f} | val_auc={vl_auc:.4f}")
 
-        improved = vl_auc > best_auc
-        if improved:
+        if vl_auc > best_auc:
             best_auc = vl_auc;  no_imp = 0
             torch.save(model.state_dict(), best_path)
             print(f"    [best] val_auc={best_auc:.4f} (epoch {epoch})")
         else:
             no_imp += 1
 
-        # always save a resumable checkpoint after every epoch
         torch.save({
             "epoch":      epoch,
             "model":      model.state_dict(),
@@ -397,6 +402,20 @@ def evaluate(model, loader, label_names, subject_ids=None):
 # 5-FOLD CROSS-VALIDATION
 # =============================================================================
 
+def _fold_is_complete(last_p: str) -> bool:
+    """Returns True only if last_p is a new-format checkpoint that finished."""
+    if not os.path.isfile(last_p):
+        return False
+    try:
+        ckpt = torch.load(last_p, map_location="cpu")
+        if not _is_new_format(ckpt):
+            return False  # old format — can't tell, re-train
+        return (ckpt["no_imp"] >= CFG["patience"]
+                or ckpt["epoch"] >= CFG["epochs"])
+    except Exception:
+        return False
+
+
 def run_kfold(subject_ids, df_bio, y, label_names, selected,
               enface_map, octa_map, resume=False):
 
@@ -418,43 +437,35 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
         best_p = os.path.join(WEIGHT_DIR, f"fold{fold}_best.pth")
         last_p = os.path.join(WEIGHT_DIR, f"fold{fold}_last.pth")
 
-        # skip folds that finished already (best weight exists + last ckpt
-        # shows early-stop or max epochs reached)
-        if resume and os.path.isfile(best_p) and os.path.isfile(last_p):
-            ckpt = torch.load(last_p, map_location="cpu")
-            finished = (ckpt["no_imp"] >= CFG["patience"]
-                        or ckpt["epoch"] >= CFG["epochs"])
-            if finished:
-                print(f"\n  FOLD {fold}: already complete, loading results...")
-                # rebuild data to evaluate
-                y_trf = y[tr_idx]
-                loc_tr, loc_vl = train_test_split(
-                    np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
-                    stratify=y_trf, random_state=SEED)
-                g_tr  = tr_idx[loc_tr]
-                g_vl  = tr_idx[loc_vl]
-                y_tr  = y[g_tr]
-                ids_ts = [subject_ids[i] for i in ts_idx]
-                X_tr, prep = prepare_biomarker(
-                    df_bio.iloc[g_tr].reset_index(drop=True), selected)
-                X_ts, _    = prepare_biomarker(
-                    df_bio.iloc[ts_idx].reset_index(drop=True), selected, **prep)
-                test_ds = TriModalDataset(
-                    ids_ts, X_ts, y[ts_idx], enface_map, octa_map, augment=False)
-                test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"],
-                                         shuffle=False, num_workers=0)
-                model = TriModalFusionModel(
-                    bio_dim=X_tr.shape[1],
-                    bio_embed=CFG["bio_embed_dim"],
-                    dropout=CFG["dropout"]).to(device)
-                model.load_state_dict(torch.load(best_p, map_location=device))
-                m = evaluate(model, test_loader, label_names, subject_ids=ids_ts)
-                print(f"  Fold {fold}: Acc={m['acc']:.4f}  AUC={m['auc']:.4f}  "
-                      f"Sens={m['sens']:.4f}  Spec={m['spec']:.4f}")
-                fold_results.append(dict(fold=fold, **m))
-                all_preds.extend(m["preds"])
-                all_labels.extend(m["labels"])
-                continue
+        # skip folds that are provably finished
+        if resume and os.path.isfile(best_p) and _fold_is_complete(last_p):
+            print(f"\n  FOLD {fold}: already complete, loading results...")
+            y_trf = y[tr_idx]
+            loc_tr, loc_vl = train_test_split(
+                np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
+                stratify=y_trf, random_state=SEED)
+            g_tr   = tr_idx[loc_tr]
+            ids_ts = [subject_ids[i] for i in ts_idx]
+            X_tr, prep = prepare_biomarker(
+                df_bio.iloc[g_tr].reset_index(drop=True), selected)
+            X_ts, _    = prepare_biomarker(
+                df_bio.iloc[ts_idx].reset_index(drop=True), selected, **prep)
+            test_ds = TriModalDataset(
+                ids_ts, X_ts, y[ts_idx], enface_map, octa_map, augment=False)
+            test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"],
+                                     shuffle=False, num_workers=0)
+            model = TriModalFusionModel(
+                bio_dim=X_tr.shape[1],
+                bio_embed=CFG["bio_embed_dim"],
+                dropout=CFG["dropout"]).to(device)
+            model.load_state_dict(torch.load(best_p, map_location=device))
+            m = evaluate(model, test_loader, label_names, subject_ids=ids_ts)
+            print(f"  Fold {fold}: Acc={m['acc']:.4f}  AUC={m['auc']:.4f}  "
+                  f"Sens={m['sens']:.4f}  Spec={m['spec']:.4f}")
+            fold_results.append(dict(fold=fold, **m))
+            all_preds.extend(m["preds"])
+            all_labels.extend(m["labels"])
+            continue
 
         print(f"\n{'=' * 70}\n  FOLD {fold}/{CFG['n_splits']}\n{'=' * 70}")
 
@@ -492,7 +503,6 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
             dropout   = CFG["dropout"],
         ).to(device)
 
-        # pass last_p as resume checkpoint when --resume flag is set
         resume_from = last_p if resume else None
 
         print(f"\n  Training fold {fold}...")
