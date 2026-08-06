@@ -9,8 +9,8 @@ Tri-Modal Fusion Pipeline
 
   Fusion: concat [768 + 768 + 256] -> LayerNorm -> MLP -> 2 classes
 
-Run:
-    python pipeline.py
+Run (fresh)  : python pipeline.py
+Run (resume) : python pipeline.py --resume
 =============================================================================
 """
 
@@ -61,7 +61,7 @@ FEATURE_SCORE_COL   = "score"
 SCORE_THRESHOLD     = 2.0
 
 IMAGE_ROOT_ENFACE   = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
-IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"  # <-- update if needed
+IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"
 
 WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion"
 LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion.txt"
@@ -88,7 +88,7 @@ CFG = dict(
 class Tee:
     def __init__(self, path):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._f = open(path, "w", encoding="utf-8")
+        self._f = open(path, "a", encoding="utf-8")  # append so resume doesn't wipe log
         self._s = sys.__stdout__
     def write(self, m):  self._s.write(m);  self._f.write(m)
     def flush(self):     self._s.flush();   self._f.flush()
@@ -135,7 +135,7 @@ def prepare_biomarker(df, selected, num_pipe=None, pca=None):
 
 
 # =============================================================================
-# DATASET  -- loads enface slices, OCTA slices, and biomarkers per patient
+# DATASET
 # =============================================================================
 
 def make_transform(augment=False):
@@ -159,7 +159,7 @@ def load_slices(subject_id, folder_map, slice_names, transform):
         print(f"[WARN] no folder for '{subject_id}'")
     frames = []
     for sn in slice_names:
-        path = stem_map.get(Path(sn).stem.lower())
+        path   = stem_map.get(Path(sn).stem.lower())
         tensor = torch.zeros(3, 224, 224)
         if path:
             try:
@@ -168,18 +168,15 @@ def load_slices(subject_id, folder_map, slice_names, transform):
                 for c in range(3):
                     ch = arr[..., c]
                     arr[..., c] = (ch - ch.mean()) / (ch.std() + 1e-8)
-                img = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8))
+                img    = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8))
                 tensor = transform(img)
             except (UnidentifiedImageError, OSError, Exception) as e:
                 print(f"[WARN] skipping corrupt slice {path}: {e}")
         frames.append(tensor)
-    return torch.stack(frames)   # (N, 3, 224, 224)
+    return torch.stack(frames)
 
 
 class TriModalDataset(Dataset):
-    """
-    Returns (enface_slices, octa_slices, biomarkers, label) per patient.
-    """
     def __init__(self, subject_ids, biomarkers, labels,
                  enface_map, octa_map, augment=False):
         self.subject_ids = subject_ids
@@ -192,9 +189,9 @@ class TriModalDataset(Dataset):
     def __len__(self): return len(self.subject_ids)
 
     def __getitem__(self, idx):
-        sid     = self.subject_ids[idx]
-        enface  = load_slices(sid, self.enface_map, SLICES_ENFACE, self.tf)
-        octa    = load_slices(sid, self.octa_map,   SLICES_OCTA,   self.tf)
+        sid    = self.subject_ids[idx]
+        enface = load_slices(sid, self.enface_map, SLICES_ENFACE, self.tf)
+        octa   = load_slices(sid, self.octa_map,   SLICES_OCTA,   self.tf)
         return (enface, octa, self.bio[idx],
                 torch.tensor(self.labels[idx], dtype=torch.long))
 
@@ -204,7 +201,6 @@ class TriModalDataset(Dataset):
 # =============================================================================
 
 class ViTEncoder(nn.Module):
-    """Frozen ViT-B/16. Shared weights instance used independently per modality."""
     def __init__(self):
         super().__init__()
         vit              = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
@@ -215,7 +211,7 @@ class ViTEncoder(nn.Module):
             p.requires_grad = False
 
     @torch.no_grad()
-    def forward(self, x):             # (B, 3, 224, 224) -> (B, 768)
+    def forward(self, x):
         B   = x.shape[0]
         x   = self.patch_embed(x).flatten(2).transpose(1, 2)
         cls = self.class_token.expand(B, -1, -1)
@@ -223,32 +219,17 @@ class ViTEncoder(nn.Module):
 
 
 class TriModalFusionModel(nn.Module):
-    """
-    Three parallel branches fused into one classifier.
-
-    Branch 1 - En face : ViTEncoder x N_enface slices -> mean pool -> (B, 768)
-    Branch 2 - OCTA    : ViTEncoder x N_octa   slices -> mean pool -> (B, 768)
-    Branch 3 - Struct  : Linear -> LayerNorm -> ReLU               -> (B, bio_embed)
-
-    Fusion: concat -> LayerNorm -> 512 -> 256 -> 128 -> num_classes
-    """
     def __init__(self, bio_dim: int, bio_embed: int = 256,
                  num_classes: int = 2, dropout: float = 0.4):
         super().__init__()
-
-        # each modality gets its own ViT instance (both frozen)
-        self.enface_vit = ViTEncoder()
-        self.octa_vit   = ViTEncoder()
-
-        # structured branch
+        self.enface_vit  = ViTEncoder()
+        self.octa_vit    = ViTEncoder()
         self.bio_encoder = nn.Sequential(
             nn.Linear(bio_dim, bio_embed),
             nn.LayerNorm(bio_embed),
             nn.ReLU(),
         )
-
-        fused_dim = VIT_DIM + VIT_DIM + bio_embed   # 768 + 768 + 256 = 1792
-
+        fused_dim = VIT_DIM + VIT_DIM + bio_embed
         self.fusion = nn.Sequential(
             nn.LayerNorm(fused_dim),
             nn.Linear(fused_dim, 512), nn.ReLU(), nn.Dropout(dropout),
@@ -256,56 +237,68 @@ class TriModalFusionModel(nn.Module):
             nn.Linear(256, 128),                  nn.Dropout(dropout),
             nn.Linear(128, num_classes),
         )
-
         n = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[TriModalFusion] fused_dim={fused_dim}  "
-              f"trainable={n:,}  (both ViTs frozen)")
+        print(f"[TriModalFusion] fused_dim={fused_dim}  trainable={n:,}  (both ViTs frozen)")
 
     def forward(self, enface, octa, bio):
-        # enface : (B, N_e, 3, H, W)
-        # octa   : (B, N_o, 3, H, W)
-        # bio    : (B, bio_dim)
         B, Ne, C, H, W = enface.shape
         _, No, *_      = octa.shape
-
         enface_emb = (self.enface_vit(enface.view(B*Ne, C, H, W))
-                          .view(B, Ne, -1).mean(dim=1))          # (B, 768)
-
+                          .view(B, Ne, -1).mean(dim=1))
         octa_emb   = (self.octa_vit(octa.view(B*No, C, H, W))
-                          .view(B, No, -1).mean(dim=1))           # (B, 768)
-
-        bio_emb    = self.bio_encoder(bio)                        # (B, bio_embed)
-
-        fused = torch.cat([enface_emb, octa_emb, bio_emb], dim=1)
-        return self.fusion(fused)
+                          .view(B, No, -1).mean(dim=1))
+        bio_emb    = self.bio_encoder(bio)
+        return self.fusion(torch.cat([enface_emb, octa_emb, bio_emb], dim=1))
 
 
 # =============================================================================
-# TRAINING
+# TRAINING  (with resume support)
 # =============================================================================
 
-def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path):
+def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
+               resume_ckpt_path=None):
+    """
+    Trains one fold.  If resume_ckpt_path points to an existing file the
+    model, optimizer, scheduler, best_auc, no_imp, and start_epoch are all
+    restored from that checkpoint so training continues exactly where it
+    stopped.
+    """
     counts    = np.bincount(y_tr)
-    weights   = torch.tensor(1.0 / (counts + 1e-6),
-                             dtype=torch.float32).to(device)
+    weights   = torch.tensor(1.0 / (counts + 1e-6), dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=CFG["lr"], weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
+    start_epoch = 1
+    best_auc    = 0.0
+    no_imp      = 0
+
+    # ---- resume ----
+    if resume_ckpt_path and os.path.isfile(resume_ckpt_path):
+        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        best_auc    = ckpt["best_auc"]
+        no_imp      = ckpt["no_imp"]
+        start_epoch = ckpt["epoch"] + 1
+        print(f"  [RESUME] fold checkpoint loaded from {resume_ckpt_path}")
+        print(f"           resuming at epoch {start_epoch}  "
+              f"best_auc={best_auc:.4f}  no_imp={no_imp}")
+    # ----------------
+
     tr_loader = DataLoader(train_ds, batch_size=len(train_ds),
                            shuffle=True,  num_workers=0)
     vl_loader = DataLoader(val_ds,   batch_size=len(val_ds),
                            shuffle=False, num_workers=0)
 
-    best_auc = 0;  no_imp = 0
-
-    for epoch in range(1, CFG["epochs"] + 1):
+    for epoch in range(start_epoch, CFG["epochs"] + 1):
         model.train()
         for enface, octa, bio, lbl in tr_loader:
             enface, octa, bio, lbl = (enface.to(device), octa.to(device),
-                                      bio.to(device), lbl.to(device))
+                                      bio.to(device),    lbl.to(device))
             optimizer.zero_grad()
             loss = criterion(model(enface, octa, bio), lbl)
             loss.backward()
@@ -318,7 +311,7 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path):
         with torch.no_grad():
             for enface, octa, bio, lbl in vl_loader:
                 enface, octa, bio, lbl = (enface.to(device), octa.to(device),
-                                          bio.to(device), lbl.to(device))
+                                          bio.to(device),    lbl.to(device))
                 p = F.softmax(model(enface, octa, bio), dim=-1)
                 vl_preds.extend(p.argmax(1).cpu().numpy())
                 vl_probs.extend(p[:, 1].cpu().numpy())
@@ -332,16 +325,27 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path):
             print(f"  Epoch {epoch:03d} | loss={loss.item():.4f} | "
                   f"val_acc={vl_acc:.4f} | val_auc={vl_auc:.4f}")
 
-        if vl_auc > best_auc:
+        improved = vl_auc > best_auc
+        if improved:
             best_auc = vl_auc;  no_imp = 0
             torch.save(model.state_dict(), best_path)
-            print(f"    checkmark best val_auc={best_auc:.4f} (epoch {epoch})")
+            print(f"    [best] val_auc={best_auc:.4f} (epoch {epoch})")
         else:
             no_imp += 1
-            torch.save(model.state_dict(), last_path)
-            if no_imp >= CFG["patience"]:
-                print(f"  [EarlyStop] epoch={epoch}  best_auc={best_auc:.4f}")
-                break
+
+        # always save a resumable checkpoint after every epoch
+        torch.save({
+            "epoch":      epoch,
+            "model":      model.state_dict(),
+            "optimizer":  optimizer.state_dict(),
+            "scheduler":  scheduler.state_dict(),
+            "best_auc":   best_auc,
+            "no_imp":     no_imp,
+        }, last_path)
+
+        if no_imp >= CFG["patience"]:
+            print(f"  [EarlyStop] epoch={epoch}  best_auc={best_auc:.4f}")
+            break
 
 
 @torch.no_grad()
@@ -350,7 +354,7 @@ def evaluate(model, loader, label_names, subject_ids=None):
     all_preds, all_probs, all_labels = [], [], []
     for enface, octa, bio, lbl in loader:
         enface, octa, bio, lbl = (enface.to(device), octa.to(device),
-                                  bio.to(device), lbl.to(device))
+                                  bio.to(device),    lbl.to(device))
         p = F.softmax(model(enface, octa, bio), dim=-1)
         all_preds.extend(p.argmax(1).cpu().numpy())
         all_probs.extend(p.cpu().numpy())
@@ -360,9 +364,7 @@ def evaluate(model, loader, label_names, subject_ids=None):
            if len(set(all_labels)) > 1 else 0.0)
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
 
-    # per-patient table
-    lnames = label_names
-    sep    = "-" * 90
+    sep = "-" * 90
     print(f"\n{sep}")
     print(f"  {'#':>4}  {'Subject ID':>22}  {'Actual':>10}  {'Predicted':>10}  "
           f"{'P(H)':>8}  {'P(D)':>8}  {'OK':>4}")
@@ -372,8 +374,8 @@ def evaluate(model, loader, label_names, subject_ids=None):
             zip(ids, all_labels, all_preds, all_probs)):
         ok = "OK" if int(gt) == int(pred) else "X"
         print(f"  {i+1:>4}  {str(sid):>22}  "
-              f"{lnames.get(int(gt),'?'):>10}  "
-              f"{lnames.get(int(pred),'?'):>10}  "
+              f"{label_names.get(int(gt),'?'):>10}  "
+              f"{label_names.get(int(pred),'?'):>10}  "
               f"{prb[0]:>8.4f}  {prb[1]:>8.4f}  {ok:>4}")
     n_ok = sum(1 for g, p in zip(all_labels, all_preds) if g == p)
     print(f"\n  Correct={n_ok}/{len(all_labels)}  Acc={acc:.4f}  AUC={auc:.4f}")
@@ -384,7 +386,6 @@ def evaluate(model, loader, label_names, subject_ids=None):
         print(f"  Sens={sens:.4f}  Spec={spec:.4f}  "
               f"TP={cm[1,1]} FN={cm[1,0]} FP={cm[0,1]} TN={cm[0,0]}")
     print(sep)
-
     cm   = confusion_matrix(all_labels, all_preds)
     sens = (cm[1,1]/(cm[1,1]+cm[1,0]) if cm.shape==(2,2) and (cm[1,1]+cm[1,0])>0 else 0)
     spec = (cm[0,0]/(cm[0,0]+cm[0,1]) if cm.shape==(2,2) and (cm[0,0]+cm[0,1])>0 else 0)
@@ -397,15 +398,15 @@ def evaluate(model, loader, label_names, subject_ids=None):
 # =============================================================================
 
 def run_kfold(subject_ids, df_bio, y, label_names, selected,
-              enface_map, octa_map):
+              enface_map, octa_map, resume=False):
 
     os.makedirs(WEIGHT_DIR, exist_ok=True)
-    skf = StratifiedKFold(n_splits=CFG["n_splits"], shuffle=True,
-                          random_state=SEED)
+    skf = StratifiedKFold(n_splits=CFG["n_splits"], shuffle=True, random_state=SEED)
     fold_results, all_preds, all_labels = [], [], []
 
     print("\n" + "=" * 70)
-    print(f"  TRI-MODAL FUSION  |  {CFG['n_splits']}-Fold CV")
+    print(f"  TRI-MODAL FUSION  |  {CFG['n_splits']}-Fold CV  "
+          f"| {'RESUME' if resume else 'FRESH'}")
     print(f"  En face slices : {len(SLICES_ENFACE)}")
     print(f"  OCTA slices    : {len(SLICES_OCTA)}")
     print(f"  Biomarkers     : {len(selected)} features")
@@ -414,29 +415,67 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
     for fold, (tr_idx, ts_idx) in enumerate(
             skf.split(np.arange(len(y)), y), 1):
 
+        best_p = os.path.join(WEIGHT_DIR, f"fold{fold}_best.pth")
+        last_p = os.path.join(WEIGHT_DIR, f"fold{fold}_last.pth")
+
+        # skip folds that finished already (best weight exists + last ckpt
+        # shows early-stop or max epochs reached)
+        if resume and os.path.isfile(best_p) and os.path.isfile(last_p):
+            ckpt = torch.load(last_p, map_location="cpu")
+            finished = (ckpt["no_imp"] >= CFG["patience"]
+                        or ckpt["epoch"] >= CFG["epochs"])
+            if finished:
+                print(f"\n  FOLD {fold}: already complete, loading results...")
+                # rebuild data to evaluate
+                y_trf = y[tr_idx]
+                loc_tr, loc_vl = train_test_split(
+                    np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
+                    stratify=y_trf, random_state=SEED)
+                g_tr  = tr_idx[loc_tr]
+                g_vl  = tr_idx[loc_vl]
+                y_tr  = y[g_tr]
+                ids_ts = [subject_ids[i] for i in ts_idx]
+                X_tr, prep = prepare_biomarker(
+                    df_bio.iloc[g_tr].reset_index(drop=True), selected)
+                X_ts, _    = prepare_biomarker(
+                    df_bio.iloc[ts_idx].reset_index(drop=True), selected, **prep)
+                test_ds = TriModalDataset(
+                    ids_ts, X_ts, y[ts_idx], enface_map, octa_map, augment=False)
+                test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"],
+                                         shuffle=False, num_workers=0)
+                model = TriModalFusionModel(
+                    bio_dim=X_tr.shape[1],
+                    bio_embed=CFG["bio_embed_dim"],
+                    dropout=CFG["dropout"]).to(device)
+                model.load_state_dict(torch.load(best_p, map_location=device))
+                m = evaluate(model, test_loader, label_names, subject_ids=ids_ts)
+                print(f"  Fold {fold}: Acc={m['acc']:.4f}  AUC={m['auc']:.4f}  "
+                      f"Sens={m['sens']:.4f}  Spec={m['spec']:.4f}")
+                fold_results.append(dict(fold=fold, **m))
+                all_preds.extend(m["preds"])
+                all_labels.extend(m["labels"])
+                continue
+
         print(f"\n{'=' * 70}\n  FOLD {fold}/{CFG['n_splits']}\n{'=' * 70}")
 
         y_trf = y[tr_idx]
         loc_tr, loc_vl = train_test_split(
             np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
             stratify=y_trf, random_state=SEED)
-        g_tr = tr_idx[loc_tr];  g_vl = tr_idx[loc_vl]
+        g_tr  = tr_idx[loc_tr];  g_vl = tr_idx[loc_vl]
         y_tr, y_vl, y_ts = y[g_tr], y[g_vl], y[ts_idx]
-
         ids_tr = [subject_ids[i] for i in g_tr]
         ids_vl = [subject_ids[i] for i in g_vl]
         ids_ts = [subject_ids[i] for i in ts_idx]
 
-        print(f"  Inner train: {len(y_tr)}  Inner val: {len(y_vl)}  "
-              f"Test: {len(y_ts)}")
+        print(f"  Inner train: {len(y_tr)}  Inner val: {len(y_vl)}  Test: {len(y_ts)}")
 
-        # biomarker preprocessing: fit on inner-train only
-        X_tr, prep = prepare_biomarker(df_bio.iloc[g_tr].reset_index(drop=True),
-                                       selected)
-        X_vl, _    = prepare_biomarker(df_bio.iloc[g_vl].reset_index(drop=True),
-                                       selected, **prep)
-        X_ts, _    = prepare_biomarker(df_bio.iloc[ts_idx].reset_index(drop=True),
-                                       selected, **prep)
+        X_tr, prep = prepare_biomarker(
+            df_bio.iloc[g_tr].reset_index(drop=True), selected)
+        X_vl, _    = prepare_biomarker(
+            df_bio.iloc[g_vl].reset_index(drop=True), selected, **prep)
+        X_ts, _    = prepare_biomarker(
+            df_bio.iloc[ts_idx].reset_index(drop=True), selected, **prep)
 
         train_ds    = TriModalDataset(ids_tr, X_tr, y_tr,
                                       enface_map, octa_map, augment=True)
@@ -453,11 +492,12 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
             dropout   = CFG["dropout"],
         ).to(device)
 
-        best_p = os.path.join(WEIGHT_DIR, f"fold{fold}_best.pth")
-        last_p = os.path.join(WEIGHT_DIR, f"fold{fold}_last.pth")
+        # pass last_p as resume checkpoint when --resume flag is set
+        resume_from = last_p if resume else None
 
         print(f"\n  Training fold {fold}...")
-        train_fold(model, y_tr, train_ds, val_ds, best_p, last_p)
+        train_fold(model, y_tr, train_ds, val_ds, best_p, last_p,
+                   resume_ckpt_path=resume_from)
 
         model.load_state_dict(torch.load(best_p, map_location=device))
         m = evaluate(model, test_loader, label_names, subject_ids=ids_ts)
@@ -498,9 +538,15 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
 # =============================================================================
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from last saved checkpoint per fold")
+    args = parser.parse_args()
+
     print("=" * 70)
     print("  Tri-Modal Fusion: En face + OCTA + Structured")
     print(f"  Device: {device}")
+    print(f"  Mode  : {'RESUME' if args.resume else 'FRESH'}")
     print("=" * 70)
 
     df          = pd.read_csv(CSV_PATH)
@@ -517,8 +563,7 @@ def main():
         y = y_raw.astype(np.int64)
 
     label_names = {0: "Healthy", 1: "Disease"}
-    print(f"  N={len(y)}  Healthy={int((y==0).sum())}  "
-          f"Disease={int((y==1).sum())}")
+    print(f"  N={len(y)}  Healthy={int((y==0).sum())}  Disease={int((y==1).sum())}")
 
     selected   = load_features_by_threshold(
         FEATURE_SCORE_CSV, FEATURE_NAME_COL, FEATURE_SCORE_COL,
@@ -528,7 +573,7 @@ def main():
     octa_map   = build_folder_map(IMAGE_ROOT_OCTA)
 
     run_kfold(subject_ids, df_bio, y, label_names,
-              selected, enface_map, octa_map)
+              selected, enface_map, octa_map, resume=args.resume)
 
 
 if __name__ == "__main__":
