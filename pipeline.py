@@ -255,13 +255,12 @@ class TriModalFusionModel(nn.Module):
 # CHECKPOINT HELPERS
 # =============================================================================
 
-def _is_new_format(ckpt: dict) -> bool:
-    """True if checkpoint was saved by this pipeline (has metadata keys)."""
+def _is_new_format(ckpt) -> bool:
     return isinstance(ckpt, dict) and "epoch" in ckpt and "model" in ckpt
 
 
 # =============================================================================
-# TRAINING  (with resume support)
+# TRAINING
 # =============================================================================
 
 def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
@@ -290,11 +289,9 @@ def train_fold(model, y_tr, train_ds, val_ds, best_path, last_path,
             print(f"  [RESUME] continuing from epoch {start_epoch}  "
                   f"best_auc={best_auc:.4f}  no_imp={no_imp}")
         else:
-            # old plain state_dict — load weights only, restart epoch count
             model.load_state_dict(ckpt)
-            print(f"  [RESUME] loaded plain state_dict from {resume_ckpt_path} "
-                  f"(old format) — epoch/optimizer state not available, "
-                  f"resuming from epoch 1 with loaded weights")
+            print(f"  [RESUME] loaded weights from old-format checkpoint, "
+                  f"epoch counter reset to 1")
 
     tr_loader = DataLoader(train_ds, batch_size=len(train_ds),
                            shuffle=True,  num_workers=0)
@@ -402,20 +399,6 @@ def evaluate(model, loader, label_names, subject_ids=None):
 # 5-FOLD CROSS-VALIDATION
 # =============================================================================
 
-def _fold_is_complete(last_p: str) -> bool:
-    """Returns True only if last_p is a new-format checkpoint that finished."""
-    if not os.path.isfile(last_p):
-        return False
-    try:
-        ckpt = torch.load(last_p, map_location="cpu")
-        if not _is_new_format(ckpt):
-            return False  # old format — can't tell, re-train
-        return (ckpt["no_imp"] >= CFG["patience"]
-                or ckpt["epoch"] >= CFG["epochs"])
-    except Exception:
-        return False
-
-
 def run_kfold(subject_ids, df_bio, y, label_names, selected,
               enface_map, octa_map, resume=False):
 
@@ -437,9 +420,10 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
         best_p = os.path.join(WEIGHT_DIR, f"fold{fold}_best.pth")
         last_p = os.path.join(WEIGHT_DIR, f"fold{fold}_last.pth")
 
-        # skip folds that are provably finished
-        if resume and os.path.isfile(best_p) and _fold_is_complete(last_p):
-            print(f"\n  FOLD {fold}: already complete, loading results...")
+        # If best weights exist, this fold is done -- skip it and re-use results
+        if resume and os.path.isfile(best_p):
+            print(f"\n  FOLD {fold}: best weight found, skipping training "
+                  f"and loading saved results...")
             y_trf = y[tr_idx]
             loc_tr, loc_vl = train_test_split(
                 np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
@@ -503,7 +487,8 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
             dropout   = CFG["dropout"],
         ).to(device)
 
-        resume_from = last_p if resume else None
+        # use last_p as resume checkpoint (handles both new and old formats)
+        resume_from = last_p if (resume and os.path.isfile(last_p)) else None
 
         print(f"\n  Training fold {fold}...")
         train_fold(model, y_tr, train_ds, val_ds, best_p, last_p,
@@ -550,7 +535,8 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
-                        help="Resume training from last saved checkpoint per fold")
+                        help="Resume: skip folds with existing best weights, "
+                             "continue mid-fold from last checkpoint")
     args = parser.parse_args()
 
     print("=" * 70)
