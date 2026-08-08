@@ -3,8 +3,8 @@
 Tri-Modal Fusion Pipeline  --  Dual Feature Score CSV
 =============================================================================
 
-  Branch 1 (En face OCT)  : ViT-B/16 -> mean pool over 9 slices  -> (B, 768)
-  Branch 2 (OCTA)         : ViT-B/16 -> mean pool over 9 slices  -> (B, 768)
+  Branch 1 (En face OCT)  : ViT-B/16 -> mean pool over N slices  -> (B, 768)
+  Branch 2 (OCTA)         : ViT-B/16 -> mean pool over N slices  -> (B, 768)
   Branch 3 (Structured)   : BiomarkerEncoder                      -> (B, 256)
 
   Fusion: concat [768 + 768 + 256] -> LayerNorm -> MLP -> 2 classes
@@ -65,19 +65,41 @@ FEATURE_SCORE_COL_1   = "score"
 SCORE_THRESHOLD_1     = 2.0
 
 # --- Feature score CSV 2 (second source) ---
-FEATURE_SCORE_CSV_2   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real_2.csv"  # <-- update
+FEATURE_SCORE_CSV_2   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real_thickness.csv"
 FEATURE_NAME_COL_2    = "feature"
 FEATURE_SCORE_COL_2   = "score"
-SCORE_THRESHOLD_2     = 2.0
+SCORE_THRESHOLD_2     = 100.0
 
 IMAGE_ROOT_ENFACE   = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
 IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"
 
-WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion_5OCT"
-LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion_5OCT.txt"
+WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion_9OCT_dualthresh"
+LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion_9OCT_dualthresh.txt"
 
-SLICES_ENFACE       = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 slices
-SLICES_OCTA         = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 slices
+# =============================================================================
+# SLICE SELECTION
+# -----------------------------------------------------------------------------
+# SLICES_ENFACE and SLICES_OCTA are plain Python lists of slice file-stems.
+# You can define them in any way you like -- examples:
+#
+#   Range-based (all 9 enface slices, highest index first):
+#       SLICES_ENFACE = [f"slice_{i}" for i in range(9, 0, -1)]
+#
+#   Range-based (first 15 out of 32 OCTA slices):
+#       SLICES_OCTA = [f"slice_{i}" for i in range(15, 0, -1)]
+#
+#   Explicit names (pick any specific slices by name):
+#       SLICES_ENFACE = ["slice_9", "slice_5", "slice_1"]
+#       SLICES_OCTA   = ["slice_32", "slice_16", "slice_8", "slice_4"]
+#
+#   Mixed:
+#       SLICES_OCTA = [f"slice_{i}" for i in range(9, 0, -1)] + ["slice_custom"]
+#
+# If a named slice file is missing for a subject it is replaced with a
+# zero tensor (the model keeps running -- no crash).
+# =============================================================================
+SLICES_ENFACE       = [f"slice_{i}" for i in range(3, 0, -1)]   # 3 enface slices
+SLICES_OCTA         = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 OCTA slices
 
 CFG = dict(
     n_splits       = 5,
@@ -131,7 +153,6 @@ def load_features_by_threshold_dual(cols: List[str]) -> List[str]:
     """
     Select features from TWO score CSVs independently, then take the union.
     Features that appear in both CSVs are de-duplicated (kept once).
-    The final list is sorted by the maximum score across both CSVs.
     """
     available = set(cols)
 
@@ -145,9 +166,9 @@ def load_features_by_threshold_dual(cols: List[str]) -> List[str]:
     print(f"[Features] CSV1: {len(set1)} features at threshold>={SCORE_THRESHOLD_1}")
     print(f"[Features] CSV2: {len(set2)} features at threshold>={SCORE_THRESHOLD_2}")
 
-    # union, de-duplicated
-    seen    = set()
-    union   = []
+    # union, de-duplicated, preserving order
+    seen  = set()
+    union = []
     for f in set1 + set2:
         if f not in seen:
             seen.add(f)
@@ -451,8 +472,8 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
     print("\n" + "=" * 70)
     print(f"  TRI-MODAL FUSION  |  {CFG['n_splits']}-Fold CV  "
           f"| {'RESUME' if resume else 'FRESH'}")
-    print(f"  En face slices : {len(SLICES_ENFACE)}")
-    print(f"  OCTA slices    : {len(SLICES_OCTA)}")
+    print(f"  En face slices ({len(SLICES_ENFACE)}): {SLICES_ENFACE}")
+    print(f"  OCTA slices    ({len(SLICES_OCTA)}): {SLICES_OCTA}")
     print(f"  Biomarkers     : {len(selected)} features (from 2 CSVs)")
     print("=" * 70)
 
