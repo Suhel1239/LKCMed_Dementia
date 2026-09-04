@@ -9,10 +9,6 @@ Tri-Modal Fusion Pipeline  --  Dual Feature Score CSV
 
   Fusion: concat [768 + 768 + 256] -> LayerNorm -> MLP -> 2 classes
 
-  Empty stacks are supported: set SLICES_ENFACE=[] or SLICES_OCTA=[] to
-  disable that branch entirely. The missing branch contributes a zero vector
-  and fused_dim shrinks accordingly.
-
   Features are selected by thresholding TWO score CSVs independently
   and taking the UNION of passing features present in the data CSV.
 
@@ -77,22 +73,33 @@ SCORE_THRESHOLD_2     = 100.0
 IMAGE_ROOT_ENFACE   = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
 IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"
 
-WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion_5OCT_no_enface_kbest_t_2.5"
-LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion_5OCT_no_enface_kbest_t_2.txt"
+WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion_9OCT_dualthresh"
+LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion_9OCT_dualthresh.txt"
 
 # =============================================================================
 # SLICE SELECTION
 # -----------------------------------------------------------------------------
-# Set either list to [] to disable that branch entirely.
-# The model detects empty lists at build time and skips the ViT encoder for
-# that branch, contributing zeros to the fusion vector instead.
+# SLICES_ENFACE and SLICES_OCTA are plain Python lists of slice file-stems.
+# You can define them in any way you like -- examples:
+#
+#   Range-based (all 9 enface slices, highest index first):
+#       SLICES_ENFACE = [f"slice_{i}" for i in range(9, 0, -1)]
+#
+#   Range-based (first 15 out of 32 OCTA slices):
+#       SLICES_OCTA = [f"slice_{i}" for i in range(15, 0, -1)]
+#
+#   Explicit names (pick any specific slices by name):
+#       SLICES_ENFACE = ["slice_9", "slice_5", "slice_1"]
+#       SLICES_OCTA   = ["slice_32", "slice_16", "slice_8", "slice_4"]
+#
+#   Mixed:
+#       SLICES_OCTA = [f"slice_{i}" for i in range(9, 0, -1)] + ["slice_custom"]
+#
+# If a named slice file is missing for a subject it is replaced with a
+# zero tensor (the model keeps running -- no crash).
 # =============================================================================
-SLICES_ENFACE = [
-    # "slice_0",
-    # "slice_1" , "slice_2" , "slice_3", "slice_4" ,
-    # "slice_5", "slice_6" ,"slice_7" ,"slice_8","slice_9",
-]
-SLICES_OCTA = [f"slice_{i}" for i in range(5, 0, -1)]   # 5 OCTA slices
+SLICES_ENFACE       = [f"slice_{i}" for i in range(3, 0, -1)]   # 3 enface slices
+SLICES_OCTA         = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 OCTA slices
 
 CFG = dict(
     n_splits       = 5,
@@ -133,6 +140,7 @@ def build_folder_map(root: str) -> Dict[str, Path]:
 
 def _features_from_csv(score_csv: str, name_col: str, score_col: str,
                        thresh: float, available_cols: set) -> List[str]:
+    """Return features from one score CSV that pass the threshold and exist in data."""
     df      = pd.read_csv(score_csv)
     passing = df[df[score_col] >= thresh][name_col].astype(str).tolist()
     matched = [f for f in passing if f in available_cols]
@@ -142,6 +150,10 @@ def _features_from_csv(score_csv: str, name_col: str, score_col: str,
 
 
 def load_features_by_threshold_dual(cols: List[str]) -> List[str]:
+    """
+    Select features from TWO score CSVs independently, then take the union.
+    Features that appear in both CSVs are de-duplicated (kept once).
+    """
     available = set(cols)
 
     set1 = _features_from_csv(
@@ -154,6 +166,7 @@ def load_features_by_threshold_dual(cols: List[str]) -> List[str]:
     print(f"[Features] CSV1: {len(set1)} features at threshold>={SCORE_THRESHOLD_1}")
     print(f"[Features] CSV2: {len(set2)} features at threshold>={SCORE_THRESHOLD_2}")
 
+    # union, de-duplicated, preserving order
     seen  = set()
     union = []
     for f in set1 + set2:
@@ -199,12 +212,6 @@ def make_transform(augment=False):
 
 
 def load_slices(subject_id, folder_map, slice_names, transform):
-    """Load named slices for one subject. Returns (N, 3, 224, 224) tensor.
-    Returns empty tensor (0, 3, 224, 224) when slice_names is empty.
-    Missing individual slices are replaced with zero tensors."""
-    if not slice_names:
-        return torch.zeros(0, 3, 224, 224)
-
     patient_dir = folder_map.get(str(subject_id)[-13:])
     stem_map: Dict[str, Path] = {}
     if patient_dir:
@@ -213,7 +220,6 @@ def load_slices(subject_id, folder_map, slice_names, transform):
                 stem_map[p.stem.lower()] = p
     else:
         print(f"[WARN] no folder for '{subject_id}'")
-
     frames = []
     for sn in slice_names:
         path   = stem_map.get(Path(sn).stem.lower())
@@ -230,7 +236,7 @@ def load_slices(subject_id, folder_map, slice_names, transform):
             except (UnidentifiedImageError, OSError, Exception) as e:
                 print(f"[WARN] skipping corrupt slice {path}: {e}")
         frames.append(tensor)
-    return torch.stack(frames)   # (N, 3, 224, 224)
+    return torch.stack(frames)
 
 
 class TriModalDataset(Dataset):
@@ -268,34 +274,25 @@ class ViTEncoder(nn.Module):
             p.requires_grad = False
 
     @torch.no_grad()
-    def forward(self, x):                              # (B*N, 3, 224, 224)
+    def forward(self, x):
         B   = x.shape[0]
         x   = self.patch_embed(x).flatten(2).transpose(1, 2)
         cls = self.class_token.expand(B, -1, -1)
-        return self.encoder(torch.cat([cls, x], dim=1))[:, 0]   # (B*N, 768)
+        return self.encoder(torch.cat([cls, x], dim=1))[:, 0]
 
 
 class TriModalFusionModel(nn.Module):
     def __init__(self, bio_dim: int, bio_embed: int = 256,
-                 num_classes: int = 2, dropout: float = 0.4,
-                 use_enface: bool = True, use_octa: bool = True):
+                 num_classes: int = 2, dropout: float = 0.4):
         super().__init__()
-        self.use_enface = use_enface
-        self.use_octa   = use_octa
-
-        if use_enface:
-            self.enface_vit = ViTEncoder()
-        if use_octa:
-            self.octa_vit = ViTEncoder()
-
+        self.enface_vit  = ViTEncoder()
+        self.octa_vit    = ViTEncoder()
         self.bio_encoder = nn.Sequential(
             nn.Linear(bio_dim, bio_embed),
             nn.LayerNorm(bio_embed),
             nn.ReLU(),
         )
-
-        fused_dim = (VIT_DIM if use_enface else 0) + \
-                    (VIT_DIM if use_octa   else 0) + bio_embed
+        fused_dim = VIT_DIM + VIT_DIM + bio_embed
         self.fusion = nn.Sequential(
             nn.LayerNorm(fused_dim),
             nn.Linear(fused_dim, 512), nn.ReLU(), nn.Dropout(dropout),
@@ -303,37 +300,18 @@ class TriModalFusionModel(nn.Module):
             nn.Linear(256, 128),                  nn.Dropout(dropout),
             nn.Linear(128, num_classes),
         )
-
-        active = ([("EnFace ViT", VIT_DIM)] if use_enface else []) + \
-                 ([("OCTA ViT",   VIT_DIM)] if use_octa   else []) + \
-                 [("Biomarker",   bio_embed)]
-        branch_str = " + ".join(f"{n}({d})" for n, d in active)
         n = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[TriModalFusion] {branch_str} -> fused={fused_dim}  "
-              f"trainable={n:,}")
+        print(f"[TriModalFusion] fused_dim={fused_dim}  trainable={n:,}  (both ViTs frozen)")
 
     def forward(self, enface, octa, bio):
-        B = bio.shape[0]
-        parts = []
-
-        if self.use_enface:
-            Ne = enface.shape[1]
-            C, H, W = enface.shape[2], enface.shape[3], enface.shape[4]
-            parts.append(
-                self.enface_vit(enface.view(B * Ne, C, H, W))
-                    .view(B, Ne, -1).mean(dim=1)
-            )
-
-        if self.use_octa:
-            No = octa.shape[1]
-            C, H, W = octa.shape[2], octa.shape[3], octa.shape[4]
-            parts.append(
-                self.octa_vit(octa.view(B * No, C, H, W))
-                    .view(B, No, -1).mean(dim=1)
-            )
-
-        parts.append(self.bio_encoder(bio))
-        return self.fusion(torch.cat(parts, dim=1))
+        B, Ne, C, H, W = enface.shape
+        _, No, *_      = octa.shape
+        enface_emb = (self.enface_vit(enface.view(B*Ne, C, H, W))
+                          .view(B, Ne, -1).mean(dim=1))
+        octa_emb   = (self.octa_vit(octa.view(B*No, C, H, W))
+                          .view(B, No, -1).mean(dim=1))
+        bio_emb    = self.bio_encoder(bio)
+        return self.fusion(torch.cat([enface_emb, octa_emb, bio_emb], dim=1))
 
 
 # =============================================================================
@@ -473,6 +451,7 @@ def evaluate(model, loader, label_names, subject_ids=None):
         print(f"  Sens={sens:.4f}  Spec={spec:.4f}  "
               f"TP={cm[1,1]} FN={cm[1,0]} FP={cm[0,1]} TN={cm[0,0]}")
     print(sep)
+    cm   = confusion_matrix(all_labels, all_preds)
     sens = (cm[1,1]/(cm[1,1]+cm[1,0]) if cm.shape==(2,2) and (cm[1,1]+cm[1,0])>0 else 0)
     spec = (cm[0,0]/(cm[0,0]+cm[0,1]) if cm.shape==(2,2) and (cm[0,0]+cm[0,1])>0 else 0)
     return dict(acc=acc, auc=auc, sens=sens, spec=spec,
@@ -486,9 +465,6 @@ def evaluate(model, loader, label_names, subject_ids=None):
 def run_kfold(subject_ids, df_bio, y, label_names, selected,
               enface_map, octa_map, resume=False):
 
-    use_enface = len(SLICES_ENFACE) > 0
-    use_octa   = len(SLICES_OCTA)   > 0
-
     os.makedirs(WEIGHT_DIR, exist_ok=True)
     skf = StratifiedKFold(n_splits=CFG["n_splits"], shuffle=True, random_state=SEED)
     fold_results, all_preds, all_labels = [], [], []
@@ -496,10 +472,8 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
     print("\n" + "=" * 70)
     print(f"  TRI-MODAL FUSION  |  {CFG['n_splits']}-Fold CV  "
           f"| {'RESUME' if resume else 'FRESH'}")
-    enface_str = f"{SLICES_ENFACE}" if use_enface else "DISABLED (empty list)"
-    octa_str   = f"{SLICES_OCTA}"   if use_octa   else "DISABLED (empty list)"
-    print(f"  En face slices ({len(SLICES_ENFACE)}): {enface_str}")
-    print(f"  OCTA slices    ({len(SLICES_OCTA)}): {octa_str}")
+    print(f"  En face slices ({len(SLICES_ENFACE)}): {SLICES_ENFACE}")
+    print(f"  OCTA slices    ({len(SLICES_OCTA)}): {SLICES_OCTA}")
     print(f"  Biomarkers     : {len(selected)} features (from 2 CSVs)")
     print("=" * 70)
 
@@ -526,12 +500,9 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
             test_loader = DataLoader(test_ds, batch_size=CFG["batch_size"],
                                      shuffle=False, num_workers=0)
             model = TriModalFusionModel(
-                bio_dim    = X_tr.shape[1],
-                bio_embed  = CFG["bio_embed_dim"],
-                dropout    = CFG["dropout"],
-                use_enface = use_enface,
-                use_octa   = use_octa,
-            ).to(device)
+                bio_dim=X_tr.shape[1],
+                bio_embed=CFG["bio_embed_dim"],
+                dropout=CFG["dropout"]).to(device)
             model.load_state_dict(torch.load(best_p, map_location=device))
             m = evaluate(model, test_loader, label_names, subject_ids=ids_ts)
             print(f"  Fold {fold}: Acc={m['acc']:.4f}  AUC={m['auc']:.4f}  "
@@ -572,11 +543,9 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
                                  shuffle=False, num_workers=0)
 
         model = TriModalFusionModel(
-            bio_dim    = X_tr.shape[1],
-            bio_embed  = CFG["bio_embed_dim"],
-            dropout    = CFG["dropout"],
-            use_enface = use_enface,
-            use_octa   = use_octa,
+            bio_dim   = X_tr.shape[1],
+            bio_embed = CFG["bio_embed_dim"],
+            dropout   = CFG["dropout"],
         ).to(device)
 
         resume_from = last_p if (resume and os.path.isfile(last_p)) else None
@@ -653,10 +622,11 @@ def main():
     label_names = {0: "Healthy", 1: "Disease"}
     print(f"  N={len(y)}  Healthy={int((y==0).sum())}  Disease={int((y==1).sum())}")
 
+    # select features from both CSVs
     selected = load_features_by_threshold_dual(df_bio.columns.tolist())
 
-    enface_map = build_folder_map(IMAGE_ROOT_ENFACE) if len(SLICES_ENFACE) > 0 else {}
-    octa_map   = build_folder_map(IMAGE_ROOT_OCTA)   if len(SLICES_OCTA)   > 0 else {}
+    enface_map = build_folder_map(IMAGE_ROOT_ENFACE)
+    octa_map   = build_folder_map(IMAGE_ROOT_OCTA)
 
     run_kfold(subject_ids, df_bio, y, label_names,
               selected, enface_map, octa_map, resume=args.resume)
