@@ -1,16 +1,19 @@
 """
 =============================================================================
-Tri-Modal Fusion Pipeline
+Tri-Modal Fusion Pipeline  --  Dual Feature Score CSV
 =============================================================================
 
-  Branch 1 (En face OCT)  : ViT-B/16 -> mean pool over 9 slices  -> (B, 768)
-  Branch 2 (OCTA)         : ViT-B/16 -> mean pool over 32 slices -> (B, 768)
+  Branch 1 (En face OCT)  : ViT-B/16 -> mean pool over N slices  -> (B, 768)
+  Branch 2 (OCTA)         : ViT-B/16 -> mean pool over N slices  -> (B, 768)
   Branch 3 (Structured)   : BiomarkerEncoder                      -> (B, 256)
 
   Fusion: concat [768 + 768 + 256] -> LayerNorm -> MLP -> 2 classes
 
-Run (fresh)  : python pipeline.py
-Run (resume) : python pipeline.py --resume
+  Features are selected by thresholding TWO score CSVs independently
+  and taking the UNION of passing features present in the data CSV.
+
+Run (fresh)  : python pipeline_dual_feature.py
+Run (resume) : python pipeline_dual_feature.py --resume
 =============================================================================
 """
 
@@ -18,7 +21,7 @@ import os, sys, warnings, argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -37,10 +40,10 @@ from torchvision.models import vit_b_16, ViT_B_16_Weights
 from PIL import Image, UnidentifiedImageError
 
 warnings.filterwarnings("ignore")
-SEED        = 42
-VIT_DIM     = 768
-PCA_COMPS   = 15
-IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+SEED       = 42
+VIT_DIM    = 768
+PCA_COMPS  = 15
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,19 +58,48 @@ TARGET_COL          = "Dia"
 SUBJECT_ID_COL      = "Subj_ID"
 BIOMARKER_START_COL = 1
 
-FEATURE_SCORE_CSV   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real.csv"
-FEATURE_NAME_COL    = "feature"
-FEATURE_SCORE_COL   = "score"
-SCORE_THRESHOLD     = 2.0
+# --- Feature score CSV 1 ---
+FEATURE_SCORE_CSV_1   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real.csv"
+FEATURE_NAME_COL_1    = "feature"
+FEATURE_SCORE_COL_1   = "score"
+SCORE_THRESHOLD_1     = 2.0
+
+# --- Feature score CSV 2 (second source) ---
+FEATURE_SCORE_CSV_2   = "/home/suhel.khan/Dimentia_Project/Feature_Engineering/b1andb2_OCT_biomarkers_feature_scores_CN_CI_real_thickness.csv"
+FEATURE_NAME_COL_2    = "feature"
+FEATURE_SCORE_COL_2   = "score"
+SCORE_THRESHOLD_2     = 100.0
 
 IMAGE_ROOT_ENFACE   = "/home/suhel.khan/Dimentia_Project/Image_data/OCT_enface_images_all_b1_b2"
 IMAGE_ROOT_OCTA     = "/home/suhel.khan/Dimentia_Project/Image_data/only_OCT_images_b1_b2"
 
-WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion"
-LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion.txt"
+WEIGHT_DIR          = "/home/suhel.khan/Dimentia_Project/Weights/trimodal_fusion_9OCT_dualthresh"
+LOG_PATH            = "/home/suhel.khan/Dimentia_Project/Results/CN_CI_after_B2/results_trimodal_fusion_9OCT_dualthresh.txt"
 
-SLICES_ENFACE       = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 slices
-SLICES_OCTA         = [f"slice_{i}" for i in range(32, 0, -1)]  # 32 slices
+# =============================================================================
+# SLICE SELECTION
+# -----------------------------------------------------------------------------
+# SLICES_ENFACE and SLICES_OCTA are plain Python lists of slice file-stems.
+# You can define them in any way you like -- examples:
+#
+#   Range-based (all 9 enface slices, highest index first):
+#       SLICES_ENFACE = [f"slice_{i}" for i in range(9, 0, -1)]
+#
+#   Range-based (first 15 out of 32 OCTA slices):
+#       SLICES_OCTA = [f"slice_{i}" for i in range(15, 0, -1)]
+#
+#   Explicit names (pick any specific slices by name):
+#       SLICES_ENFACE = ["slice_9", "slice_5", "slice_1"]
+#       SLICES_OCTA   = ["slice_32", "slice_16", "slice_8", "slice_4"]
+#
+#   Mixed:
+#       SLICES_OCTA = [f"slice_{i}" for i in range(9, 0, -1)] + ["slice_custom"]
+#
+# If a named slice file is missing for a subject it is replaced with a
+# zero tensor (the model keeps running -- no crash).
+# =============================================================================
+SLICES_ENFACE       = [f"slice_{i}" for i in range(3, 0, -1)]   # 3 enface slices
+SLICES_OCTA         = [f"slice_{i}" for i in range(9, 0, -1)]   # 9 OCTA slices
 
 CFG = dict(
     n_splits       = 5,
@@ -106,16 +138,47 @@ def build_folder_map(root: str) -> Dict[str, Path]:
     return m
 
 
-def load_features_by_threshold(score_csv, name_col, score_col, thresh, cols):
+def _features_from_csv(score_csv: str, name_col: str, score_col: str,
+                       thresh: float, available_cols: set) -> List[str]:
+    """Return features from one score CSV that pass the threshold and exist in data."""
     df      = pd.read_csv(score_csv)
     passing = df[df[score_col] >= thresh][name_col].astype(str).tolist()
-    matched = [f for f in passing if f in set(cols)]
-    if not matched:
-        raise ValueError("No features matched threshold.")
+    matched = [f for f in passing if f in available_cols]
     lookup  = dict(zip(df[name_col].astype(str), df[score_col]))
     matched.sort(key=lambda f: lookup.get(f, 0), reverse=True)
-    print(f"[Features] {len(matched)} selected (threshold>={thresh})")
     return matched
+
+
+def load_features_by_threshold_dual(cols: List[str]) -> List[str]:
+    """
+    Select features from TWO score CSVs independently, then take the union.
+    Features that appear in both CSVs are de-duplicated (kept once).
+    """
+    available = set(cols)
+
+    set1 = _features_from_csv(
+        FEATURE_SCORE_CSV_1, FEATURE_NAME_COL_1, FEATURE_SCORE_COL_1,
+        SCORE_THRESHOLD_1, available)
+    set2 = _features_from_csv(
+        FEATURE_SCORE_CSV_2, FEATURE_NAME_COL_2, FEATURE_SCORE_COL_2,
+        SCORE_THRESHOLD_2, available)
+
+    print(f"[Features] CSV1: {len(set1)} features at threshold>={SCORE_THRESHOLD_1}")
+    print(f"[Features] CSV2: {len(set2)} features at threshold>={SCORE_THRESHOLD_2}")
+
+    # union, de-duplicated, preserving order
+    seen  = set()
+    union = []
+    for f in set1 + set2:
+        if f not in seen:
+            seen.add(f)
+            union.append(f)
+
+    if not union:
+        raise ValueError("No features passed threshold from either CSV.")
+
+    print(f"[Features] Union: {len(union)} unique features selected")
+    return union
 
 
 def prepare_biomarker(df, selected, num_pipe=None, pca=None):
@@ -409,9 +472,9 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
     print("\n" + "=" * 70)
     print(f"  TRI-MODAL FUSION  |  {CFG['n_splits']}-Fold CV  "
           f"| {'RESUME' if resume else 'FRESH'}")
-    print(f"  En face slices : {len(SLICES_ENFACE)}")
-    print(f"  OCTA slices    : {len(SLICES_OCTA)}")
-    print(f"  Biomarkers     : {len(selected)} features")
+    print(f"  En face slices ({len(SLICES_ENFACE)}): {SLICES_ENFACE}")
+    print(f"  OCTA slices    ({len(SLICES_OCTA)}): {SLICES_OCTA}")
+    print(f"  Biomarkers     : {len(selected)} features (from 2 CSVs)")
     print("=" * 70)
 
     for fold, (tr_idx, ts_idx) in enumerate(
@@ -420,10 +483,8 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
         best_p = os.path.join(WEIGHT_DIR, f"fold{fold}_best.pth")
         last_p = os.path.join(WEIGHT_DIR, f"fold{fold}_last.pth")
 
-        # If best weights exist, this fold is done -- skip it and re-use results
         if resume and os.path.isfile(best_p):
-            print(f"\n  FOLD {fold}: best weight found, skipping training "
-                  f"and loading saved results...")
+            print(f"\n  FOLD {fold}: best weight found, skipping training...")
             y_trf = y[tr_idx]
             loc_tr, loc_vl = train_test_split(
                 np.arange(len(tr_idx)), test_size=CFG["inner_val_frac"],
@@ -487,7 +548,6 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
             dropout   = CFG["dropout"],
         ).to(device)
 
-        # use last_p as resume checkpoint (handles both new and old formats)
         resume_from = last_p if (resume and os.path.isfile(last_p)) else None
 
         print(f"\n  Training fold {fold}...")
@@ -502,7 +562,6 @@ def run_kfold(subject_ids, df_bio, y, label_names, selected,
         all_preds.extend(m["preds"])
         all_labels.extend(m["labels"])
 
-    # aggregate
     print("\n" + "=" * 70 + "\n  AGGREGATE RESULTS\n" + "=" * 70)
     accs  = [r["acc"]  for r in fold_results]
     aucs  = [r["auc"]  for r in fold_results]
@@ -540,9 +599,11 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  Tri-Modal Fusion: En face + OCTA + Structured")
+    print("  Tri-Modal Fusion: En face + OCTA + Structured  [Dual Feature CSV]")
     print(f"  Device: {device}")
     print(f"  Mode  : {'RESUME' if args.resume else 'FRESH'}")
+    print(f"  Feature CSV 1 threshold : {SCORE_THRESHOLD_1}")
+    print(f"  Feature CSV 2 threshold : {SCORE_THRESHOLD_2}")
     print("=" * 70)
 
     df          = pd.read_csv(CSV_PATH)
@@ -561,9 +622,8 @@ def main():
     label_names = {0: "Healthy", 1: "Disease"}
     print(f"  N={len(y)}  Healthy={int((y==0).sum())}  Disease={int((y==1).sum())}")
 
-    selected   = load_features_by_threshold(
-        FEATURE_SCORE_CSV, FEATURE_NAME_COL, FEATURE_SCORE_COL,
-        SCORE_THRESHOLD, df_bio.columns.tolist())
+    # select features from both CSVs
+    selected = load_features_by_threshold_dual(df_bio.columns.tolist())
 
     enface_map = build_folder_map(IMAGE_ROOT_ENFACE)
     octa_map   = build_folder_map(IMAGE_ROOT_OCTA)
